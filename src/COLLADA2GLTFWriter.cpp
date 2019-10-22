@@ -431,6 +431,9 @@ bool COLLADA2GLTF::Writer::writeNodeToGroup(std::vector<GLTF::Node*>* group, con
 	_nodes[id] = node;
 	_nodeInstances[colladaNodeId] = node;
 
+	std::function<void(GLTF::Node*, GLTF::Node*)> nodeClonePredicate =
+		std::bind(&Writer::nodeClonePredicate, this, std::placeholders::_1, std::placeholders::_2);
+
 	// Instance Nodes
 	const COLLADAFW::InstanceNodePointerArray& instanceNodes = colladaNode->getInstanceNodes();
 	size_t nodeCount = instanceNodes.getCount();
@@ -441,7 +444,7 @@ bool COLLADA2GLTF::Writer::writeNodeToGroup(std::vector<GLTF::Node*>* group, con
 		if (iter != _nodeInstances.end()) {
 			// Resolve the instance
 			GLTF::Node* cloneNode = new GLTF::Node();
-			iter->second->clone(cloneNode);
+			iter->second->clone(cloneNode, nodeClonePredicate);
 			node->children.push_back(cloneNode);
 		}
 		else {
@@ -451,6 +454,14 @@ bool COLLADA2GLTF::Writer::writeNodeToGroup(std::vector<GLTF::Node*>* group, con
 				_nodeInstanceTargets[instanceNodeId] = std::vector<GLTF::Node*>();
 			}
 			_nodeInstanceTargets[instanceNodeId].push_back(node);
+
+			// We need to keep track of nodes the depend on unresolved instances
+			// So that if they are cloned we can resolve to all the clones as well
+			std::map<GLTF::Node*, std::vector<COLLADAFW::UniqueId>>::iterator iter2 = _nodeInstanceTargetMapping.find(node);
+			if (iter2 == _nodeInstanceTargetMapping.end()) {
+				_nodeInstanceTargetMapping[node] = std::vector<COLLADAFW::UniqueId>();
+			}
+			_nodeInstanceTargetMapping[node].push_back(instanceNodeId);
 		}
 	}
 
@@ -468,12 +479,28 @@ bool COLLADA2GLTF::Writer::writeNodeToGroup(std::vector<GLTF::Node*>* group, con
 		std::vector<GLTF::Node*> instanceTargets = findNodeInstanceTargets->second;
 		for (GLTF::Node* instanceTarget : instanceTargets) {
 			GLTF::Node* cloneNode = new GLTF::Node();
-			node->clone(cloneNode);
+			node->clone(cloneNode, nodeClonePredicate);
 			instanceTarget->children.push_back(cloneNode);
 		}
 	}
 
 	return result;
+}
+
+void COLLADA2GLTF::Writer::nodeClonePredicate(GLTF::Node* node, GLTF::Node* clonedNode) {
+	_nodeInstanceTargetMapping[clonedNode] = std::vector<COLLADAFW::UniqueId>();
+
+	std::map<GLTF::Node*, std::vector<COLLADAFW::UniqueId>>::iterator iter = _nodeInstanceTargetMapping.find(node);
+	if (iter != _nodeInstanceTargetMapping.end()) {
+		std::vector<COLLADAFW::UniqueId>& instanceIds = iter->second;
+		for (COLLADAFW::UniqueId& instanceId : instanceIds) {
+			// In case this node is cloned, we need to track the instance_nodes it contains
+			_nodeInstanceTargetMapping[clonedNode].push_back(instanceId);
+
+			// This node now needs to be notified when a child instance_node is resolved
+			_nodeInstanceTargets[instanceId].push_back(clonedNode);
+		}
+	}
 }
 
 bool COLLADA2GLTF::Writer::writeNodesToGroup(std::vector<GLTF::Node*>* group, const COLLADAFW::NodePointerArray& nodes) {
@@ -1146,9 +1173,9 @@ bool COLLADA2GLTF::Writer::writeEffect(const COLLADAFW::Effect* effect) {
 			}
 		}
 
-		if (_extrasHandler->bumpTexture != NULL) {
-			material->values->bumpTexture = fromColladaTexture(effectCommon, _extrasHandler->bumpTexture->samplerId);
-			_extrasHandler->bumpTexture = NULL;
+		auto bumpTextureIt = _extrasHandler->bumpTextures.find(effect->getUniqueId());
+		if (bumpTextureIt != _extrasHandler->bumpTextures.end()) {
+			material->values->bumpTexture = fromColladaTexture(effectCommon, (*bumpTextureIt).second->samplerId);
 		}
 
 		bool doubleSided = _extrasHandler->doubleSided.find(effect->getUniqueId()) != _extrasHandler->doubleSided.end();
@@ -1246,7 +1273,7 @@ bool COLLADA2GLTF::Writer::writeCamera(const COLLADAFW::Camera* colladaCamera) {
 bool COLLADA2GLTF::Writer::writeImage(const COLLADAFW::Image* colladaImage) {
 	const COLLADABU::URI imageUri = colladaImage->getImageURI();
 	COLLADABU::URI resolvedPath = COLLADABU::URI::nativePathToUri(_options->basePath + imageUri.originalStr());
-	GLTF::Image* image = GLTF::Image::load(resolvedPath.toNativePath(COLLADABU::Utils::getSystemType()));
+	GLTF::Image* image = GLTF::Image::load(resolvedPath.toNativePath(COLLADABU::Utils::getSystemType()), _options->writeAbsoluteUris);
 	image->stringId = colladaImage->getOriginalId();
 	_images[colladaImage->getUniqueId()] = image;
 	return true;
